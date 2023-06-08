@@ -1,0 +1,134 @@
+1
+
+// 导入相关的包
+import org.apache.spark.mllib.evaluation.RankingMetrics
+import org.apache.spark.ml.evaluation.RegressionEvaluator
+import org.apache.spark.ml.recommendation.ALS
+import org.apache.spark.ml.tuning.{ParamGridBuilder, CrossValidator}
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types._
+import spark.implicits._
+
+// 加载数据。因为不需要timestamp列，因此立即删除它
+val file = "hdfs://localhost:9000/data/dataset/ml/movielens/ratings.csv"
+    　
+val ratingsDF1 = spark.read.option("header", "true").
+                            option("inferSchema", "true").
+                            csv(file).
+                            drop("timestamp")
+    　
+2
+
+ratingsDF1.count
+ratingsDF1.printSchema
+
+
+3
+
+ratingsDF1.show(5)
+
+4
+
+// 看看被评分的电影总共有多少部：
+ratingsDF1.select("movieId").distinct().count
+    　
+// 看看有多少用户参与评分：
+ratingsDF1.select("userId").distinct().count
+
+5
+// 快速检查谁是活跃的电影评分者
+val ratingsByUserDF = ratingsDF1.groupBy("userId").count()
+ratingsByUserDF.orderBy($"count".desc).show(10)
+
+6
+// 分析每部电影的最大评分数量
+val ratingsByMovieDF = ratingsDF1.groupBy("movieId").count()
+ratingsByMovieDF.orderBy($"count".desc).show(10)
+
+7
+// 为训练和测试准备数据
+val Array(trainingData, testData) = ratingsDF1.randomSplit(Array(0.8, 0.2))
+
+8
+// 建立ALS的实例
+val als = new ALS().setRank(12).
+                    setMaxIter(10).
+                    setRegParam(0.03).
+                    setUserCol("userId").
+                    setItemCol("movieId").
+                    setRatingCol("rating")
+
+9
+// 训练模型
+val model = als.fit(trainingData)
+    　
+// 从Spark 2.2.0开始，可以将coldStartStrategy参数设置为drop，以便删除包含NaN值的预测的DataFrame中的任何行。
+// 然后将在非nan数据上计算评估度量，该度量将是有效的。
+model.setColdStartStrategy("drop")
+
+10
+// 执行预测
+val predictions = model.transform(testData)
+    　
+// 查看预测结果
+predictions.sort("userId").show(10)
+
+11 
+val predictions_dropNaN = predictions.na.drop(Array("prediction"))
+predictions_dropNaN.count
+
+12
+// 设置一个评估器（evaluator）来计算RMSE度量指标
+val evaluator = new RegressionEvaluator().setMetricName("rmse").
+                                          setLabelCol("rating").
+                                          setPredictionCol("prediction")
+    　
+val rmse = evaluator.evaluate(predictions_dropNaN)
+println(s"Root-mean-square error = ${rmse}")
+
+13
+// 为所有用户推荐排名前五的电影
+model.recommendForAllUsers(5).show(false)
+
+14
+// 为每部电影推荐top 3个用户
+val recMovies = model.recommendForAllItems(3)
+recMovies.show(5,false)
+
+15
+// 读取电影数据集，这样就能看到电影标题了
+val moviesFile = "hdfs://localhost:9000/data/dataset/ml/movielens/movies.csv"
+val moviesDF = spark.read.option("header", "true").option("inferSchema", "true").csv(moviesFile)
+    　
+val recMoviesWithInfoDF = recMovies.join(moviesDF, "movieId")
+recMoviesWithInfoDF.select("movieId", "title", "recommendations").show(5, false)
+
+16
+// 使用CrossValidator对ALS模型进行调优
+val paramGrid = new ParamGridBuilder()
+                    .addGrid(als.regParam, Array(0.05, 0.15))
+					.addGrid(als.rank, Array(12,20))
+					.build
+    　
+val crossValidator=new CrossValidator()
+                        .setEstimator(als)
+						.setEvaluator(evaluator)
+						.setEstimatorParamMaps(paramGrid)
+						.setNumFolds(3)
+    　
+// 打印出4个超参数组合
+crossValidator.getEstimatorParamMaps.foreach(println)
+
+17
+//这需要一段时间才能完成超过10个实验
+val cvModel = crossValidator.fit(trainingData)
+
+// 执行预测并删除空值
+val predictions2 = cvModel.transform(testData).na.drop
+    　
+val evaluator2 = new RegressionEvaluator()
+                      .setMetricName("rmse")
+					  .setLabelCol("rating")
+					  .setPredictionCol("prediction")
+    　
+val rmse2 = evaluator2.evaluate(predictions2)
